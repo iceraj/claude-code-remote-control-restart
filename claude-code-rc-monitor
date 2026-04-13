@@ -1,16 +1,36 @@
 #!/usr/bin/env python3
 """
-claude-code-rc-monitor — Keep a Claude Code /rc session alive in tmux.
+claude-code-rc-monitor — Keep a Claude Code /rc session alive.
 
-Usage: claude-code-rc-monitor <session-name>
+Usage:
+  claude-code-rc-monitor <name> [--tmux | --pid PID] [--timeout-loop DURATION]
+  claude-code-rc-monitor --list-pids
+  claude-code-rc-monitor --help
 
-Finds the single Claude Code instance running in the current tmux session,
-sends /rc <session-name> to start remote control, then sleeps for up to 1 hour.
-On timeout, Enter key, or SIGUSR1/SIGHUP, it disconnects and restarts /rc.
+Arguments:
+  <name>                   Remote control name (required unless --list-pids).
 
-Press Ctrl+C to quit.
+Options:
+  --tmux                   Find the single Claude Code instance in the current
+                           tmux session and send /rc there. This is the default
+                           when neither --tmux nor --pid is given.
+  --pid PID                Target a specific Claude PID. Its enclosing tmux pane
+                           is located automatically and used to send keys.
+  --list-pids              List every Claude PID on this machine. For each PID
+                           that lives inside a tmux pane, show the tmux session
+                           (and window.pane). Then exit.
+  --timeout-loop DURATION  Refresh interval. Bare numbers are seconds; suffix
+                           'm' for minutes or 'h' for hours (e.g. 3600, 30m, 1h).
+                           Default: 3600 (one hour).
+  -h, --help               Show this help and exit.
+
+Behaviour:
+  Sends /rc <name> to the target Claude pane, then waits up to the timeout.
+  On timeout, Enter on stdin, or SIGUSR1/SIGHUP it disconnects and restarts /rc.
+  Press Ctrl+C to quit.
 """
 
+import argparse
 import os
 import select
 import signal
@@ -18,7 +38,8 @@ import subprocess
 import sys
 import time
 
-REFRESH_INTERVAL = 3600  # 1 hour
+
+DEFAULT_TIMEOUT = 3600  # 1 hour
 
 
 def log(msg):
@@ -37,12 +58,39 @@ def run_cmd(args):
     return r.stdout.strip(), r.returncode
 
 
-def get_tmux_session():
-    out, rc = run_cmd(["tmux", "display-message", "-p", "#{session_name}"])
-    if rc != 0:
-        die("Not running inside a tmux session")
-    return out
+# --- Duration parsing ---
 
+def parse_duration(s):
+    """Parse a duration string into seconds.
+
+    Accepts bare seconds ('3600'), explicit seconds ('3600s'),
+    minutes ('30m'), or hours ('1h'). Case-insensitive.
+    """
+    if s is None:
+        raise ValueError("missing duration")
+    s = str(s).strip().lower()
+    if not s:
+        raise ValueError("empty duration")
+
+    suffix_mult = {"s": 1, "m": 60, "h": 3600}
+    mult = 1
+    num = s
+    if s[-1] in suffix_mult:
+        mult = suffix_mult[s[-1]]
+        num = s[:-1]
+
+    try:
+        value = float(num)
+    except ValueError:
+        raise ValueError(f"not a number: {s!r}")
+
+    secs = int(value * mult)
+    if secs <= 0:
+        raise ValueError(f"must be positive: {s!r}")
+    return secs
+
+
+# --- Process tree helpers ---
 
 def _is_claude_command(cmd):
     """Check if a command string is a claude process.
@@ -52,6 +100,25 @@ def _is_claude_command(cmd):
     exe = cmd.split()[0] if cmd.split() else ""
     basename = os.path.basename(exe)
     return basename == "claude"
+
+
+def _read_ps():
+    """Return (ppid_map, cmd_map, children_map) from `ps -eo pid,ppid,command`."""
+    ps_out, _ = run_cmd(["ps", "-eo", "pid,ppid,command"])
+    ppid_map = {}
+    cmd_map = {}
+    children_map = {}
+    for line in ps_out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, cmd = parts
+        if pid == "PID":
+            continue
+        ppid_map[pid] = ppid
+        cmd_map[pid] = cmd
+        children_map.setdefault(ppid, []).append(pid)
+    return ppid_map, cmd_map, children_map
 
 
 def _get_descendants(pid, children_map):
@@ -65,11 +132,46 @@ def _get_descendants(pid, children_map):
     return descendants
 
 
-def find_claude_panes(session):
-    """Find panes whose shell has a claude descendant process.
+# --- tmux helpers ---
 
-    Walks the full process tree so that wrapper scripts like
-    bin/myclaude.sh -> claude --options are detected.
+def _tmux_available():
+    _, rc = run_cmd(["tmux", "has-session"])
+    # rc 0 if a session exists; non-zero otherwise (tmux may still be installed).
+    # Use `tmux ls` exit code as a softer check.
+    _, rc2 = run_cmd(["tmux", "ls"])
+    return rc == 0 or rc2 == 0
+
+
+def get_tmux_session():
+    out, rc = run_cmd(["tmux", "display-message", "-p", "#{session_name}"])
+    if rc != 0:
+        die("Not running inside a tmux session")
+    return out
+
+
+def _list_all_panes():
+    """List all tmux panes across all sessions.
+
+    Returns dict: shell_pid -> (session_name, "W.P").
+    Empty dict if tmux unavailable or no sessions.
+    """
+    out, rc = run_cmd([
+        "tmux", "list-panes", "-a",
+        "-F", "#{session_name}\t#{window_index}.#{pane_index}\t#{pane_pid}",
+    ])
+    panes = {}
+    if rc != 0:
+        return panes
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            sess, pane_id, shell_pid = parts
+            panes[shell_pid] = (sess, pane_id)
+    return panes
+
+
+def find_claude_panes(session):
+    """Find panes in the given session whose shell has a claude descendant.
 
     Returns a list of (tmux_target, claude_pid) tuples.
     """
@@ -90,20 +192,8 @@ def find_claude_panes(session):
     if not shell_pids:
         return []
 
-    ps_out, _ = run_cmd(["ps", "-eo", "pid,ppid,command"])
+    _, cmd_map, children_map = _read_ps()
 
-    # Build a children map and a command map from ps output
-    children_map = {}  # parent_pid -> [child_pids]
-    cmd_map = {}       # pid -> command string
-    for line in ps_out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        pid, ppid, cmd = parts
-        cmd_map[pid] = cmd
-        children_map.setdefault(ppid, []).append(pid)
-
-    # For each pane shell, walk descendants to find claude
     claude_panes = []
     for shell_pid, tmux_target in shell_pids.items():
         for desc_pid in _get_descendants(shell_pid, children_map):
@@ -113,8 +203,57 @@ def find_claude_panes(session):
     return claude_panes
 
 
+def find_pane_for_pid(pid):
+    """Given a claude PID, walk up its ppid chain to find the enclosing tmux
+    pane. Returns "session:W.P" or None.
+    """
+    ppid_map, _, _ = _read_ps()
+    pane_map = _list_all_panes()
+
+    cur = str(pid)
+    seen = set()
+    while cur in ppid_map and cur not in seen:
+        seen.add(cur)
+        if cur in pane_map:
+            sess, pane_id = pane_map[cur]
+            return f"{sess}:{pane_id}"
+        cur = ppid_map[cur]
+    # Also handle the case where the PID itself is a pane shell (unlikely for claude)
+    if str(pid) in pane_map:
+        sess, pane_id = pane_map[str(pid)]
+        return f"{sess}:{pane_id}"
+    return None
+
+
+def list_all_claude_pids():
+    """List every claude process. Returns list of (pid, cmd, tmux_info)
+    where tmux_info is "session:W.P" or None.
+    """
+    ppid_map, cmd_map, _ = _read_ps()
+    pane_map = _list_all_panes()
+
+    claude_pids = [pid for pid, cmd in cmd_map.items() if _is_claude_command(cmd)]
+    claude_pids.sort(key=lambda p: int(p))
+
+    results = []
+    for pid in claude_pids:
+        cur = pid
+        seen = set()
+        tmux_info = None
+        while cur in ppid_map and cur not in seen:
+            seen.add(cur)
+            if cur in pane_map:
+                sess, pane_id = pane_map[cur]
+                tmux_info = f"{sess}:{pane_id}"
+                break
+            cur = ppid_map[cur]
+        results.append((pid, cmd_map[pid], tmux_info))
+    return results
+
+
+# --- Pane I/O ---
+
 def tmux_send_keys(target, *keys):
-    """Send keys to a tmux pane."""
     subprocess.run(
         ["tmux", "send-keys", "-t", target] + list(keys),
         capture_output=True, text=True,
@@ -122,7 +261,6 @@ def tmux_send_keys(target, *keys):
 
 
 def capture_pane(target):
-    """Read the visible contents of a tmux pane."""
     out, _ = run_cmd(["tmux", "capture-pane", "-t", target, "-p"])
     return out
 
@@ -145,18 +283,15 @@ def is_thinking(target):
     pane_text = capture_pane(target)
     lines = pane_text.splitlines()
 
-    # Find the prompt line (❯) and scan upward past the separator
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("❯"):
-            # Scan upward from the separator, skip blanks and tips
             for j in range(i - 2, max(i - 8, -1), -1):
                 candidate = lines[j].strip()
                 if not candidate or candidate.startswith("─"):
                     continue
                 if candidate.startswith("⎿"):
                     continue
-                # First real content line — check for spinner
                 return "…" in candidate
             break
     return False
@@ -176,24 +311,18 @@ def wait_for_idle(target, timeout=300):
 
 def restart_rc(target, name):
     """Disconnect any active /rc and start a new one with the given name."""
-    # Wait for Claude to finish any active work
     if not wait_for_idle(target):
         log("Warning: timed out waiting for Claude to become idle, proceeding anyway")
 
-    # Clear any partial input
     tmux_send_keys(target, "Escape")
     time.sleep(0.3)
 
-    # Check if RC is already active by sending /remote-control.
-    # If active: shows a menu (Disconnect / Show QR / Continue).
-    # If not active: starts RC directly ("Remote Control connecting").
     tmux_send_keys(target, "/remote-control", "Enter")
     time.sleep(2)
 
     pane_text = capture_pane(target)
 
     if "Disconnect this session" in pane_text:
-        # Menu is showing — navigate to "Disconnect this session" (top item)
         log("RC active — disconnecting via menu")
         tmux_send_keys(target, "Up")
         time.sleep(0.3)
@@ -202,15 +331,12 @@ def restart_rc(target, name):
         tmux_send_keys(target, "Enter")
         time.sleep(1)
 
-        # Verify disconnect
         pane_text = capture_pane(target)
         if "Remote Control disconnected" in pane_text:
             log("Disconnect confirmed")
         else:
             log("Warning: disconnect not confirmed in pane output")
     elif "Remote Control connecting" in pane_text or "Remote Control active" in pane_text:
-        # /remote-control started a new session (RC wasn't active before).
-        # Disconnect it so we can reconnect with the correct name.
         log("RC was not active — /remote-control started a session, disconnecting it")
         tmux_send_keys(target, "/remote-control", "Enter")
         time.sleep(2)
@@ -225,12 +351,10 @@ def restart_rc(target, name):
     else:
         log("Warning: unexpected pane state after /remote-control")
 
-    # Start new /rc session with the given name
     log(f"Starting /rc {name}")
     tmux_send_keys(target, f"/rc {name}", "Enter")
     time.sleep(2)
 
-    # Verify connection
     pane_text = capture_pane(target)
     if "Remote Control connecting" in pane_text or "Remote Control active" in pane_text:
         log("RC session started successfully")
@@ -238,7 +362,7 @@ def restart_rc(target, name):
         log("Warning: RC session start not confirmed in pane output")
 
 
-# --- Signal handling ---
+# --- Signal handling & loop ---
 
 _wakeup = False
 
@@ -248,12 +372,12 @@ def _on_signal(signum, frame):
     _wakeup = True
 
 
-def wait_for_trigger():
-    """Block up to REFRESH_INTERVAL. Return early on signal or Enter."""
+def wait_for_trigger(timeout):
+    """Block up to `timeout` seconds. Return early on signal or Enter."""
     global _wakeup
     _wakeup = False
 
-    deadline = time.monotonic() + REFRESH_INTERVAL
+    deadline = time.monotonic() + timeout
     while True:
         if _wakeup:
             return "signal"
@@ -278,39 +402,139 @@ def check_claude_alive(pid):
         return False
 
 
-def main():
-    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
-        print(__doc__.strip())
-        sys.exit(0 if "--help" in sys.argv else 1)
+# --- Modes ---
 
-    name = sys.argv[1]
+def cmd_list_pids():
+    rows = list_all_claude_pids()
+    if not rows:
+        print("No Claude Code processes found.")
+        return 0
+    width = max(len(pid) for pid, _, _ in rows)
+    for pid, cmd, tmux_info in rows:
+        loc = tmux_info if tmux_info else "-"
+        print(f"{pid:>{width}}  {loc:<30}  {cmd}")
+    return 0
+
+
+def resolve_target_tmux():
     session = get_tmux_session()
+    panes = find_claude_panes(session)
+    if len(panes) == 0:
+        die("No Claude Code instance found in this tmux session")
+    if len(panes) > 1:
+        targets = ", ".join(f"{t} (pid {p})" for t, p in panes)
+        die(f"Found {len(panes)} Claude instances — expected 1: {targets}")
+    return panes[0]  # (target, pid)
 
+
+def resolve_target_pid(pid):
+    if not check_claude_alive(pid):
+        die(f"PID {pid} is not running")
+    target = find_pane_for_pid(pid)
+    if not target:
+        die(f"Could not find a tmux pane containing PID {pid}")
+    return target, str(pid)
+
+
+def run_loop(initial_target, initial_pid, name, timeout, rescan_tmux_session):
+    """Main refresh loop.
+
+    If rescan_tmux_session is set, rescans that session each iteration so a
+    restarted Claude is picked up. Otherwise reuses the fixed target/pid.
+    """
     signal.signal(signal.SIGUSR1, _on_signal)
     signal.signal(signal.SIGHUP, _on_signal)
 
-    log(f"RC Monitor | session: {session} | name: {name} | pid: {os.getpid()}")
-    log(f"Refresh every {REFRESH_INTERVAL // 60}m. Enter/SIGUSR1/SIGHUP to refresh. Ctrl+C to quit.")
+    log(
+        f"RC Monitor | target: {initial_target} | claude pid: {initial_pid} | "
+        f"name: {name} | monitor pid: {os.getpid()}"
+    )
+    mins = timeout / 60
+    log(
+        f"Refresh every {timeout}s ({mins:g}m). "
+        "Enter/SIGUSR1/SIGHUP to refresh. Ctrl+C to quit."
+    )
 
+    target, pid = initial_target, initial_pid
     while True:
-        panes = find_claude_panes(session)
+        if rescan_tmux_session:
+            panes = find_claude_panes(rescan_tmux_session)
+            if len(panes) == 0:
+                die("No Claude Code instance found in this tmux session")
+            if len(panes) > 1:
+                targets = ", ".join(f"{t} (pid {p})" for t, p in panes)
+                die(f"Found {len(panes)} Claude instances — expected 1: {targets}")
+            target, pid = panes[0]
 
-        if len(panes) == 0:
-            die("No Claude Code instance found in this tmux session")
-        if len(panes) > 1:
-            targets = ", ".join(f"{t} (pid {p})" for t, p in panes)
-            die(f"Found {len(panes)} Claude instances — expected 1: {targets}")
-
-        target, pid = panes[0]
         log(f"Sending /rc {name} -> {target} (pid {pid})")
         restart_rc(target, name)
 
-        reason = wait_for_trigger()
+        reason = wait_for_trigger(timeout)
 
         if not check_claude_alive(pid):
             log(f"Claude {pid} exited, rescanning...")
+            if not rescan_tmux_session:
+                die("Targeted PID has exited; nothing to refresh")
         else:
             log(f"Refreshing ({reason})")
+
+
+# --- Entry point ---
+
+def _print_help_and_exit(code=0):
+    print(__doc__.strip())
+    sys.exit(code)
+
+
+def main():
+    # Bare invocation: show help.
+    if len(sys.argv) == 1:
+        _print_help_and_exit(0)
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("name", nargs="?")
+    parser.add_argument("--tmux", action="store_true")
+    parser.add_argument("--pid", type=int)
+    parser.add_argument("--list-pids", action="store_true", dest="list_pids")
+    parser.add_argument("--timeout-loop", default=str(DEFAULT_TIMEOUT), dest="timeout_loop")
+    parser.add_argument("-h", "--help", action="store_true")
+
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        # argparse already wrote an error message
+        raise
+
+    if args.help:
+        _print_help_and_exit(0)
+
+    if args.list_pids:
+        sys.exit(cmd_list_pids())
+
+    if args.tmux and args.pid is not None:
+        die("--tmux and --pid are mutually exclusive")
+
+    if not args.name:
+        log("Error: remote control name is required (first positional argument).")
+        print()
+        _print_help_and_exit(2)
+
+    try:
+        timeout = parse_duration(args.timeout_loop)
+    except ValueError as e:
+        die(f"Invalid --timeout-loop value: {e}")
+
+    name = args.name
+
+    if args.pid is not None:
+        target, pid = resolve_target_pid(args.pid)
+        rescan_session = None
+    else:
+        # --tmux explicit, or default behaviour
+        target, pid = resolve_target_tmux()
+        rescan_session = get_tmux_session()
+
+    run_loop(target, pid, name, timeout, rescan_session)
 
 
 if __name__ == "__main__":
